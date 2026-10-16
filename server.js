@@ -1,8 +1,8 @@
 /* =========================================================
    NVINH NOVA — KEY SERVER v2.0.0
    - Device lock cứng (mỗi key 1 máy)
+   - Auto clean key hết hạn mỗi 10 phút
    - Log chi tiết
-   - Thông báo lỗi rõ ràng
    ========================================================= */
 require('dotenv').config();
 
@@ -64,6 +64,7 @@ async function initDb() {
     CREATE INDEX IF NOT EXISTS idx_keys_key ON keys(key);
     CREATE INDEX IF NOT EXISTS idx_devices_key_id ON devices(key_id);
     CREATE INDEX IF NOT EXISTS idx_logs_key_id ON logs(key_id);
+    CREATE INDEX IF NOT EXISTS idx_keys_expires ON keys(expires_at);
   `);
   console.log('✅ Database khởi tạo xong');
   console.log('✅ DEVICE LOCK: BẬT CỨNG (mỗi key chỉ dùng 1 máy)');
@@ -97,6 +98,21 @@ async function logAction(keyId, action, deviceId, ip, detail) {
       [keyId, action, deviceId, ip, detail]
     );
   } catch (_) {}
+}
+
+function getStatusCondition(status){
+  switch(status){
+    case 'active':
+      return `is_active = 1 AND (expires_at IS NULL OR expires_at > EXTRACT(EPOCH FROM NOW()))`;
+    case 'used':
+      return `used_count > 0`;
+    case 'expiring':
+      return `is_active = 1 AND expires_at IS NOT NULL AND expires_at > EXTRACT(EPOCH FROM NOW()) AND expires_at < EXTRACT(EPOCH FROM NOW()) + 86400 * 3`;
+    case 'expired':
+      return `expires_at IS NOT NULL AND expires_at < EXTRACT(EPOCH FROM NOW())`;
+    default:
+      return '1=1';
+  }
 }
 
 /* ---------- 3. APP ---------- */
@@ -174,6 +190,7 @@ app.get('/', (req, res) => {
     service: 'NVINH NOVA Key Server',
     version: '2.0.0',
     device_lock: true,
+    auto_clean: true,
     time: Date.now()
   });
 });
@@ -183,7 +200,7 @@ app.get('/health', (req, res) => {
 });
 
 // =========================================================
-// POST /api/verify-key — Xác thực key
+// POST /api/verify-key
 // =========================================================
 app.post('/api/verify-key', verifyLimiter, async (req, res) => {
   const { key } = req.body || {};
@@ -230,9 +247,7 @@ app.post('/api/verify-key', verifyLimiter, async (req, res) => {
       });
     }
 
-    // =========================================================
-    // 4. DEVICE LOCK — BẬT CỨNG
-    // =========================================================
+    // === 4. DEVICE LOCK ===
     if (!deviceId) {
       await logAction(row.id, 'verify_fail', '', ip, 'Thiếu device_id');
       return res.status(400).json({
@@ -293,7 +308,7 @@ app.post('/api/verify-key', verifyLimiter, async (req, res) => {
 
     await logAction(row.id, 'verify_ok', deviceId, ip, 'Xác thực thành công');
 
-    // === 7. Tạo token ===
+    // === 7. Token ===
     const token = signToken({
       keyId: row.id,
       key: row.key,
@@ -396,21 +411,28 @@ adminRouter.post('/create-key', async (req, res) => {
   }
 });
 
-// Danh sách key
+// Danh sách key (có filter status)
 adminRouter.get('/keys', async (req, res) => {
   const page = Math.max(1, parseInt(req.query.page) || 1);
   const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 50));
   const offset = (page - 1) * limit;
   const search = (req.query.search || '').trim().toUpperCase();
+  const status = (req.query.status || '').trim();
 
   try {
-    let whereClause = '';
+    let whereParts = [];
     let params = [];
 
     if (search) {
-      whereClause = 'WHERE key LIKE $1 OR label LIKE $1';
       params.push(`%${search}%`);
+      whereParts.push(`(key LIKE $${params.length} OR label LIKE $${params.length})`);
     }
+
+    if (status) {
+      whereParts.push(getStatusCondition(status));
+    }
+
+    const whereClause = whereParts.length > 0 ? 'WHERE ' + whereParts.join(' AND ') : '';
 
     const totalQ = await pool.query(
       `SELECT COUNT(*) AS c FROM keys ${whereClause}`, params
@@ -578,7 +600,7 @@ adminRouter.post('/delete-used', async (req, res) => {
   }
 });
 
-// Xoá key hết hạn
+// Xoá key hết hạn (dùng bởi auto-clean + panel)
 adminRouter.post('/delete-expired', async (req, res) => {
   try {
     const r = await pool.query(
@@ -586,6 +608,9 @@ adminRouter.post('/delete-expired', async (req, res) => {
        WHERE expires_at IS NOT NULL
        AND expires_at < EXTRACT(EPOCH FROM NOW())`
     );
+    if (r.rowCount > 0){
+      console.log(`🧹 Manual clean: Đã xóa ${r.rowCount} key hết hạn`);
+    }
     res.json({ ok: true, deleted: r.rowCount });
   } catch (e) {
     res.status(500).json({ ok: false, message: e.message });
@@ -633,16 +658,48 @@ app.use((err, req, res, next) => {
   res.status(500).json({ ok: false, message: 'Lỗi server' });
 });
 
-/* ---------- 9. START ---------- */
+/* =========================================================
+   9. AUTO CLEAN — Tự động xóa key hết hạn mỗi 10 phút
+   ========================================================= */
+async function autoCleanExpiredKeys(){
+  try {
+    const r = await pool.query(
+      `DELETE FROM keys
+       WHERE expires_at IS NOT NULL
+       AND expires_at < EXTRACT(EPOCH FROM NOW())`
+    );
+    if (r.rowCount > 0){
+      console.log(`🧹 Auto-clean: Đã xóa ${r.rowCount} key hết hạn lúc ${new Date().toLocaleString('vi-VN')}`);
+    }
+  } catch (e){
+    console.error('[auto-clean] Lỗi:', e.message);
+  }
+}
+
+/* =========================================================
+   10. START
+   ========================================================= */
 const PORT = process.env.PORT || 3000;
 
 initDb()
   .then(() => {
     app.listen(PORT, () => {
+      console.log('========================================');
       console.log(`✅ Server chạy tại http://localhost:${PORT}`);
       console.log(`✅ Version: 2.0.0`);
       console.log(`✅ Device lock: BẬT CỨNG (mỗi key 1 máy)`);
+      console.log(`✅ Auto-clean: MỖI 10 PHÚT`);
+      console.log('========================================');
     });
+
+    // Chạy auto-clean lần đầu sau 30 giây
+    setTimeout(() => {
+      console.log('🧹 Chạy auto-clean lần đầu...');
+      autoCleanExpiredKeys();
+    }, 30 * 1000);
+
+    // Sau đó mỗi 10 phút
+    setInterval(autoCleanExpiredKeys, 10 * 60 * 1000);
   })
   .catch(err => {
     console.error('❌ Không khởi tạo được DB:', err);
