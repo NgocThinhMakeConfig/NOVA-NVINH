@@ -1,0 +1,327 @@
+/* =========================================================
+   NOVA SECURITY SUITE v2 — FIXED
+   Sửa: lag, chặn nhầm mobile, phá input, rò rỉ interval
+   ========================================================= */
+(function () {
+  "use strict";
+
+  const CONFIG = {
+    devtools: {
+      enabled: true,
+      checkIntervalMs: 1200,      // 500 -> 1200 (giảm tải, vẫn đủ nhạy)
+      thresholdDelta: 260,        // 160 -> 260 (tránh chặn nhầm mobile/zoom)
+      action: "overlay",
+      redirectUrl: "about:blank",
+      overlayMessage: "⚠ PHÁT HIỆN DEVELOPER TOOLS\nVui lòng đóng để tiếp tục",
+    },
+    shortcuts: {
+      enabled: true,
+      // Chỉ chặn các tổ hợp NGUY HIỂM, giữ nguyên phím khác cho app
+      blockList: [
+        { key: "F12" },
+        { ctrl: true, shift: true, key: "I" },
+        { ctrl: true, shift: true, key: "J" },
+        { ctrl: true, shift: true, key: "C" },
+        { ctrl: true, shift: true, key: "K" },
+        { ctrl: true, key: "U" },
+      ],
+    },
+    contextMenu: { enabled: true },
+    // ĐỔI: chỉ chặn select trên text KHÔNG phải input/textarea/contenteditable
+    textSelection: { enabled: true },
+    dragDrop: { enabled: true },
+    consoleWarning: {
+      enabled: true,
+      title: "⛔ CẢNH BÁO!",
+      text: "Khu vực này chỉ dành cho Developer của NVINH NOVA.",
+    },
+    // Cho phép bypass bằng localStorage để dev/test
+    bypassKey: "nova_sec_bypass",
+  };
+
+  let overlayElement = null;
+  let monitorIntervalId = null;
+  let blockedCount = 0;
+
+  /* ---------- Bypass cho dev ---------- */
+  function isBypassed() {
+    try {
+      return localStorage.getItem(CONFIG.bypassKey) === "1";
+    } catch { return false; }
+  }
+  // Bật/tắt bằng console: novaSecurity.bypass(true)
+  window.novaSecurity = {
+    bypass(on) {
+      try { localStorage.setItem(CONFIG.bypassKey, on ? "1" : "0"); } catch {}
+      console.log("[NOVA SEC] Bypass =", !!on, "— reload để áp dụng");
+    },
+    stats() { return { blockedCount }; },
+    config: CONFIG,
+  };
+  if (isBypassed()) {
+    console.warn("[NOVA SEC] Đang ở chế độ BYPASS — tắt bằng novaSecurity.bypass(false)");
+    return;
+  }
+
+  /* ---------- Overlay ---------- */
+  function createOverlay() {
+    if (overlayElement) return overlayElement;
+    overlayElement = document.createElement("div");
+    overlayElement.id = "__nova_sec_overlay__";
+    Object.assign(overlayElement.style, {
+      position: "fixed",
+      inset: "0",
+      background:
+        "radial-gradient(circle at 50% 40%, #1a0308 0%, #050103 60%, #000 100%)",
+      color: "#ff3d55",
+      zIndex: "2147483647",
+      display: "flex",
+      flexDirection: "column",
+      alignItems: "center",
+      justifyContent: "center",
+      gap: "18px",
+      fontSize: "20px",
+      fontWeight: "800",
+      fontFamily: "system-ui, -apple-system, sans-serif",
+      textAlign: "center",
+      padding: "24px",
+      userSelect: "none",
+      whiteSpace: "pre-line",
+      textShadow: "0 0 14px rgba(255,0,68,.55)",
+    });
+
+    const icon = document.createElement("div");
+    icon.textContent = "🛡";
+    icon.style.fontSize = "64px";
+    icon.style.filter = "drop-shadow(0 0 18px rgba(255,0,68,.7))";
+    overlayElement.appendChild(icon);
+
+    const txt = document.createElement("div");
+    txt.textContent = CONFIG.devtools.overlayMessage;
+    overlayElement.appendChild(txt);
+
+    const sub = document.createElement("div");
+    sub.textContent = "N VINH NOVA — SOURCE PROTECTED";
+    sub.style.cssText =
+      "font-size:11px;letter-spacing:.24em;color:#c98c93;font-weight:700;margin-top:6px";
+    overlayElement.appendChild(sub);
+
+    return overlayElement;
+  }
+
+  function showOverlay() {
+    const el = createOverlay();
+    const parent = document.body || document.documentElement;
+    if (parent && !parent.contains(el)) parent.appendChild(el);
+  }
+
+  function hideOverlay() {
+    if (overlayElement && overlayElement.parentNode) {
+      overlayElement.parentNode.removeChild(overlayElement);
+    }
+  }
+
+  function setProtectionState(isOpen) {
+    if (isOpen) {
+      blockedCount++;
+      if (CONFIG.devtools.action === "redirect") {
+        location.replace(CONFIG.devtools.redirectUrl);
+      } else if (CONFIG.devtools.action === "blank") {
+        document.documentElement.innerHTML = "";
+      } else {
+        showOverlay();
+      }
+    } else {
+      hideOverlay();
+    }
+  }
+
+  /* ---------- Chặn chuột phải / kéo thả ---------- */
+  function preventDefaultHandler(e) {
+    e.preventDefault();
+    return false;
+  }
+  function initContextMenuBlock() {
+    if (CONFIG.contextMenu.enabled)
+      window.addEventListener("contextmenu", preventDefaultHandler, true);
+  }
+  function initDragDropBlock() {
+    if (CONFIG.dragDrop.enabled)
+      window.addEventListener("dragstart", preventDefaultHandler, true);
+  }
+
+  /* ---------- Chặn bôi đen (CHỈ text thường) ---------- */
+  function initSelectionBlock() {
+    if (!CONFIG.textSelection.enabled) return;
+
+    // Vẫn cho phép select trong input / textarea / contenteditable
+    const isEditable = (el) =>
+      el &&
+      (el.tagName === "INPUT" ||
+        el.tagName === "TEXTAREA" ||
+        el.isContentEditable);
+
+    window.addEventListener(
+      "selectstart",
+      (e) => {
+        if (isEditable(e.target)) return;
+        e.preventDefault();
+      },
+      true
+    );
+
+    const style = document.createElement("style");
+    style.id = "__nova_sec_style__";
+    style.textContent = `
+      *:not(input):not(textarea):not([contenteditable="true"]) {
+        -webkit-user-select: none !important;
+        -moz-user-select: none !important;
+        -ms-user-select: none !important;
+        user-select: none !important;
+      }
+      input, textarea, [contenteditable="true"] {
+        -webkit-user-select: text !important;
+        user-select: text !important;
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  /* ---------- Chặn phím tắt (CHỈ các tổ hợp nguy hiểm) ---------- */
+  function initShortcutBlock() {
+    if (!CONFIG.shortcuts.enabled) return;
+
+    const match = (e, rule) => {
+      const key = (e.key || "").toUpperCase();
+      const code = e.keyCode;
+      const ruleKey = (rule.key || "").toUpperCase();
+
+      // F12 có thể là key="F12" hoặc keyCode=123
+      const keyMatch =
+        key === ruleKey ||
+        (ruleKey === "F12" && code === 123);
+
+      if (!keyMatch) return false;
+      if (!!rule.ctrl !== (e.ctrlKey || e.metaKey)) return false;
+      if (!!rule.shift !== e.shiftKey) return false;
+      if (!!rule.alt !== e.altKey) return false;
+      return true;
+    };
+
+    window.addEventListener(
+      "keydown",
+      (e) => {
+        // KHÔNG chặn khi focus vào input/textarea của app
+        const t = e.target;
+        if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+
+        for (const rule of CONFIG.shortcuts.blockList) {
+          if (match(e, rule)) {
+            e.preventDefault();
+            e.stopPropagation();
+            return false;
+          }
+        }
+      },
+      true
+    );
+  }
+
+  /* ---------- Console warning ---------- */
+  function displayConsoleWarning() {
+    if (!CONFIG.consoleWarning.enabled) return;
+    setTimeout(() => {
+      console.log(
+        "%c" + CONFIG.consoleWarning.title,
+        "color:#ff0044;font-size:36px;font-weight:900;text-shadow:0 0 12px rgba(255,0,68,.6);"
+      );
+      console.log(
+        "%c" + CONFIG.consoleWarning.text,
+        "color:#fff;font-size:14px;font-weight:600;"
+      );
+      console.log(
+        "%cBypass cho dev: novaSecurity.bypass(true)",
+        "color:#c98c93;font-size:12px;font-style:italic;"
+      );
+    }, 200);
+  }
+
+  /* ---------- Phát hiện DevTools (SỬA: không spam) ---------- */
+  function monitorDevToolsState() {
+    if (!CONFIG.devtools.enabled) return;
+
+    let lastState = false;
+    let lastCheck = 0;
+    const MIN_GAP = CONFIG.devtools.checkIntervalMs;
+
+    // 1) Kích thước cửa sổ (chỉ áp dụng cho desktop)
+    const isDesktop = () =>
+      !/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+
+    function sizeHeuristic() {
+      if (!isDesktop()) return false;
+      const w = window.outerWidth - window.innerWidth;
+      const h = window.outerHeight - window.innerHeight;
+      return (
+        w > CONFIG.devtools.thresholdDelta ||
+        h > CONFIG.devtools.thresholdDelta
+      );
+    }
+
+    // 2) Bẫy console qua getter id — CHỈ chạy đúng 1 lần
+    let debuggerDetected = false;
+    try {
+      const trap = new Image();
+      Object.defineProperty(trap, "id", {
+        get() { debuggerDetected = true; return "trap"; },
+      });
+      console.log("%c", trap); // in 1 lần
+    } catch (_) {}
+
+    monitorIntervalId = setInterval(() => {
+      const now = performance.now();
+      if (now - lastCheck < MIN_GAP) return;
+      lastCheck = now;
+
+      // Bỏ qua nếu tab đang ẩn (tiết kiệm CPU + tránh false positive)
+      if (document.hidden) return;
+
+      const isOpen = sizeHeuristic() || debuggerDetected;
+
+      // CHỈ cập nhật khi trạng thái đổi
+      if (isOpen !== lastState) {
+        lastState = isOpen;
+        setProtectionState(isOpen);
+      }
+
+      // Reset cờ bẫy để lần sau phát hiện lại
+      debuggerDetected = false;
+    }, 400); // vòng lặp nội bộ 400ms, nhưng logic chặn bởi MIN_GAP
+  }
+
+  /* ---------- Cleanup ---------- */
+  function cleanup() {
+    if (monitorIntervalId) {
+      clearInterval(monitorIntervalId);
+      monitorIntervalId = null;
+    }
+  }
+  window.addEventListener("beforeunload", cleanup);
+  // Nếu là SPA: window.addEventListener('pagehide', cleanup)
+
+  /* ---------- Boot ---------- */
+  function boot() {
+    displayConsoleWarning();
+    initContextMenuBlock();
+    initDragDropBlock();
+    initSelectionBlock();
+    initShortcutBlock();
+    monitorDevToolsState();
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", boot);
+  } else {
+    boot();
+  }
+})();
