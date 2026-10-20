@@ -1,7 +1,7 @@
 {
   "name": "nvinh-nova-key-server",
-  "version": "2.0.0",
-  "description": "Key server cho app NVINH NOVA (có device lock và auto-clean)",
+  "version": "3.0.0",
+  "description": "Key server cho app NVINH NOVA (Final)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
