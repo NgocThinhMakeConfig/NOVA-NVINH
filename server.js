@@ -1,7 +1,7 @@
 /* =========================================================
-   NVINH NOVA — KEY SERVER v2.1.0 (ĐÃ TẮT AUTO-CLEAN)
+   NVINH NOVA — KEY SERVER v2.0.0
    - Device lock cứng (mỗi key 1 máy)
-   - KHÔNG BAO GIỜ TỰ ĐỘNG XÓA KEY
+   - Auto clean key hết hạn mỗi 10 phút
    - Log chi tiết
    ========================================================= */
 require('dotenv').config();
@@ -68,7 +68,6 @@ async function initDb() {
   `);
   console.log('✅ Database khởi tạo xong');
   console.log('✅ DEVICE LOCK: BẬT CỨNG (mỗi key chỉ dùng 1 máy)');
-  console.log('✅ AUTO-CLEAN: ĐÃ TẮT HOÀN TOÀN (Key không bao giờ bị xóa)');
 }
 
 /* ---------- 2. HELPERS ---------- */
@@ -189,15 +188,15 @@ app.get('/', (req, res) => {
   res.json({
     ok: true,
     service: 'NVINH NOVA Key Server',
-    version: '2.1.0',
+    version: '2.0.0',
     device_lock: true,
-    auto_clean: false, // Đã tắt
+    auto_clean: true,
     time: Date.now()
   });
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, time: Date.now(), version: '2.1.0' });
+  res.json({ ok: true, time: Date.now(), version: '2.0.0' });
 });
 
 // =========================================================
@@ -216,7 +215,7 @@ app.post('/api/verify-key', verifyLimiter, async (req, res) => {
   const cleanKey = key.trim().toUpperCase();
 
   try {
-    const { rows } = await pool.query('SELECT * FROM keys WHERE key_code = $1', [cleanKey]);
+    const { rows } = await pool.query('SELECT * FROM keys WHERE key = $1', [cleanKey]);
     const row = rows[0];
 
     // === 1. Key không tồn tại ===
@@ -601,7 +600,7 @@ adminRouter.post('/delete-used', async (req, res) => {
   }
 });
 
-// Xoá key hết hạn (dùng bởi panel - KHÔNG TỰ ĐỘNG CHẠY)
+// Xoá key hết hạn (dùng bởi auto-clean + panel)
 adminRouter.post('/delete-expired', async (req, res) => {
   try {
     const r = await pool.query(
@@ -660,7 +659,25 @@ app.use((err, req, res, next) => {
 });
 
 /* =========================================================
-   9. START
+   9. AUTO CLEAN — Tự động xóa key hết hạn mỗi 10 phút
+   ========================================================= */
+async function autoCleanExpiredKeys(){
+  try {
+    const r = await pool.query(
+      `DELETE FROM keys
+       WHERE expires_at IS NOT NULL
+       AND expires_at < EXTRACT(EPOCH FROM NOW())`
+    );
+    if (r.rowCount > 0){
+      console.log(`🧹 Auto-clean: Đã xóa ${r.rowCount} key hết hạn lúc ${new Date().toLocaleString('vi-VN')}`);
+    }
+  } catch (e){
+    console.error('[auto-clean] Lỗi:', e.message);
+  }
+}
+
+/* =========================================================
+   10. START
    ========================================================= */
 const PORT = process.env.PORT || 3000;
 
@@ -669,11 +686,20 @@ initDb()
     app.listen(PORT, () => {
       console.log('========================================');
       console.log(`✅ Server chạy tại http://localhost:${PORT}`);
-      console.log(`✅ Version: 2.1.0`);
+      console.log(`✅ Version: 2.0.0`);
       console.log(`✅ Device lock: BẬT CỨNG (mỗi key 1 máy)`);
-      console.log(`✅ Auto-clean: ĐÃ TẮT HOÀN TOÀN`);
+      console.log(`✅ Auto-clean: MỖI 10 PHÚT`);
       console.log('========================================');
     });
+
+    // Chạy auto-clean lần đầu sau 30 giây
+    setTimeout(() => {
+      console.log('🧹 Chạy auto-clean lần đầu...');
+      autoCleanExpiredKeys();
+    }, 30 * 1000);
+
+    // Sau đó mỗi 10 phút
+    setInterval(autoCleanExpiredKeys, 10 * 60 * 1000);
   })
   .catch(err => {
     console.error('❌ Không khởi tạo được DB:', err);
