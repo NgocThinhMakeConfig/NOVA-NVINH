@@ -1,8 +1,8 @@
 /* =========================================================
-   NVINH NOVA — KEY SERVER v4.0.0 (FINAL)
+   NVINH NOVA — KEY SERVER v4.5.0 (Dùng chung DB với AIMLOCK)
+   - Sử dụng bảng keys_nova để tránh xung đột
    - Device lock cứng (mỗi key 1 máy)
-   - KHÔNG BAO GIỜ TỰ ĐỘNG XÓA KEY
-   - Tự động Fix lỗi Database
+   - Không bao giờ tự xóa key
    ========================================================= */
 require('dotenv').config();
 
@@ -26,16 +26,16 @@ const pool = new Pool({
 
 async function initDb() {
   try {
-    console.log('⏳ Đang kiểm tra Database...');
-    // Thử truy vấn cột is_active. Nếu lỗi -> bảng cũ thiếu cột -> Xóa tạo lại
-    await pool.query('SELECT is_active FROM keys LIMIT 1');
-    console.log('✅ Bảng keys đã tồn tại và đầy đủ cột.');
+    console.log('⏳ Đang kiểm tra Database cho NOVA...');
+    // Kiểm tra bảng keys_nova
+    await pool.query('SELECT is_active FROM keys_nova LIMIT 1');
+    console.log('✅ Bảng keys_nova đã tồn tại và đầy đủ cột.');
   } catch (err) {
     if (err.code === '42P01' || err.code === '42703') {
-      console.log('⚠️ Phát hiện bảng keys lỗi hoặc thiếu cột. Đang tự động xóa và tạo lại...');
-      await pool.query('DROP TABLE IF EXISTS keys CASCADE');
+      console.log('⚠️ Phát hiện bảng keys_nova lỗi hoặc chưa có. Đang tạo mới...');
+      await pool.query('DROP TABLE IF EXISTS keys_nova CASCADE');
       await pool.query(`
-        CREATE TABLE keys (
+        CREATE TABLE keys_nova (
           id SERIAL PRIMARY KEY,
           key_code TEXT UNIQUE NOT NULL,
           label TEXT DEFAULT '',
@@ -49,32 +49,28 @@ async function initDb() {
           last_used_at BIGINT
         );
       `);
-      console.log('✅ Đã tạo lại bảng keys thành công!');
+      console.log('✅ Đã tạo bảng keys_nova thành công!');
     } else {
       throw err;
     }
   }
 
-  // Tạo các bảng phụ (devices, logs) nếu chưa có
+  // Tạo các bảng phụ (devices_nova, logs_nova)
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS devices (
-      id SERIAL PRIMARY KEY, key_id INTEGER NOT NULL REFERENCES keys(id) ON DELETE CASCADE,
+    CREATE TABLE IF NOT EXISTS devices_nova (
+      id SERIAL PRIMARY KEY, key_id INTEGER NOT NULL REFERENCES keys_nova(id) ON DELETE CASCADE,
       device_id TEXT NOT NULL, first_seen BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()),
       last_seen BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()), user_agent TEXT, ip TEXT,
       UNIQUE(key_id, device_id)
     );
-    CREATE TABLE IF NOT EXISTS logs (
-      id SERIAL PRIMARY KEY, key_id INTEGER REFERENCES keys(id) ON DELETE SET NULL,
+    CREATE TABLE IF NOT EXISTS logs_nova (
+      id SERIAL PRIMARY KEY, key_id INTEGER REFERENCES keys_nova(id) ON DELETE SET NULL,
       action TEXT NOT NULL, device_id TEXT, ip TEXT, detail TEXT,
       created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())
     );
-    CREATE INDEX IF NOT EXISTS idx_keys_key_code ON keys(key_code);
-    CREATE INDEX IF NOT EXISTS idx_devices_key_id ON devices(key_id);
-    CREATE INDEX IF NOT EXISTS idx_logs_key_id ON logs(key_id);
+    CREATE INDEX IF NOT EXISTS idx_keys_nova_key_code ON keys_nova(key_code);
   `);
-  console.log('✅ Database khởi tạo xong hoàn toàn!');
-  console.log('✅ DEVICE LOCK: BẬT CỨNG (mỗi key chỉ dùng 1 máy)');
-  console.log('✅ AUTO-CLEAN: ĐÃ TẮT HOÀN TOÀN (Không bao giờ tự xóa key)');
+  console.log('✅ Database NOVA khởi tạo xong hoàn toàn!');
 }
 
 /* ---------- 2. HELPERS ---------- */
@@ -100,7 +96,7 @@ function verifyToken(token) {
 async function logAction(keyId, action, deviceId, ip, detail) {
   try {
     await pool.query(
-      `INSERT INTO logs (key_id, action, device_id, ip, detail) VALUES ($1, $2, $3, $4, $5)`,
+      `INSERT INTO logs_nova (key_id, action, device_id, ip, detail) VALUES ($1, $2, $3, $4, $5)`,
       [keyId, action, deviceId, ip, detail]
     );
   } catch (_) {}
@@ -163,8 +159,7 @@ function requireToken(req, res, next) {
 }
 
 /* ---------- 6. PUBLIC ROUTES ---------- */
-app.get('/', (req, res) => res.json({ ok: true, service: 'NVINH NOVA', version: '4.0.0', device_lock: true, auto_clean: false, time: Date.now() }));
-app.get('/health', (req, res) => res.json({ ok: true, time: Date.now(), version: '4.0.0' }));
+app.get('/', (req, res) => res.json({ ok: true, service: 'NVINH NOVA', version: '4.5.0', table: 'keys_nova', time: Date.now() }));
 
 // POST /api/verify-key
 app.post('/api/verify-key', verifyLimiter, async (req, res) => {
@@ -177,7 +172,7 @@ app.post('/api/verify-key', verifyLimiter, async (req, res) => {
   const cleanKey = key.trim().toUpperCase();
 
   try {
-    const { rows } = await pool.query('SELECT * FROM keys WHERE key_code = $1', [cleanKey]);
+    const { rows } = await pool.query('SELECT * FROM keys_nova WHERE key_code = $1', [cleanKey]);
     const row = rows[0];
 
     if (!row) { await logAction(null, 'verify_fail', deviceId, ip, 'Key không tồn tại'); return res.status(404).json({ ok: false, valid: false, message: 'Key không tồn tại' }); }
@@ -192,7 +187,7 @@ app.post('/api/verify-key', verifyLimiter, async (req, res) => {
 
     if (!deviceId) { await logAction(row.id, 'verify_fail', '', ip, 'Thiếu device_id'); return res.status(400).json({ ok: false, valid: false, message: 'Thiếu thông tin thiết bị' }); }
 
-    const { rows: devs } = await pool.query('SELECT device_id, first_seen FROM devices WHERE key_id = $1', [row.id]);
+    const { rows: devs } = await pool.query('SELECT device_id, first_seen FROM devices_nova WHERE key_id = $1', [row.id]);
     const isKnown = devs.some(d => d.device_id === deviceId);
 
     if (!isKnown) {
@@ -200,21 +195,21 @@ app.post('/api/verify-key', verifyLimiter, async (req, res) => {
         await logAction(row.id, 'verify_fail', deviceId, ip, `Vượt số thiết bị (${devs.length}/${row.max_devices})`);
         return res.status(403).json({ ok: false, valid: false, message: `Key đã được kích hoạt trên ${row.max_devices} thiết bị khác. Vui lòng liên hệ admin để reset.` });
       }
-      await pool.query(`INSERT INTO devices (key_id, device_id, user_agent, ip) VALUES ($1, $2, $3, $4) ON CONFLICT (key_id, device_id) DO NOTHING`, [row.id, deviceId, ua, ip]);
+      await pool.query(`INSERT INTO devices_nova (key_id, device_id, user_agent, ip) VALUES ($1, $2, $3, $4) ON CONFLICT (key_id, device_id) DO NOTHING`, [row.id, deviceId, ua, ip]);
       await logAction(row.id, 'device_new', deviceId, ip, `Thiết bị mới #${devs.length + 1}`);
     } else {
-      await pool.query('UPDATE devices SET last_seen = $1 WHERE key_id = $2 AND device_id = $3', [now, row.id, deviceId]);
+      await pool.query('UPDATE devices_nova SET last_seen = $1 WHERE key_id = $2 AND device_id = $3', [now, row.id, deviceId]);
     }
 
     if (!row.activated_at && row.duration_days > 0) {
       const expires = now + row.duration_days * 86400;
-      await pool.query('UPDATE keys SET activated_at = $1, expires_at = $2 WHERE id = $3', [now, expires, row.id]);
+      await pool.query('UPDATE keys_nova SET activated_at = $1, expires_at = $2 WHERE id = $3', [now, expires, row.id]);
       row.activated_at = now;
       row.expires_at = expires;
       await logAction(row.id, 'activated', deviceId, ip, `Kích hoạt lần đầu, hạn ${row.duration_days} ngày`);
     }
 
-    await pool.query('UPDATE keys SET used_count = used_count + 1, last_used_at = $1 WHERE id = $2', [now, row.id]);
+    await pool.query('UPDATE keys_nova SET used_count = used_count + 1, last_used_at = $1 WHERE id = $2', [now, row.id]);
     await logAction(row.id, 'verify_ok', deviceId, ip, 'Xác thực thành công');
 
     const token = signToken({ keyId: row.id, key_code: row.key_code, label: row.label, deviceId: deviceId });
@@ -229,7 +224,7 @@ app.post('/api/verify-key', verifyLimiter, async (req, res) => {
 // POST /api/heartbeat
 app.post('/api/heartbeat', requireToken, async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT * FROM keys WHERE id = $1', [req.user.keyId]);
+    const { rows } = await pool.query('SELECT * FROM keys_nova WHERE id = $1', [req.user.keyId]);
     const row = rows[0];
     if (!row) return res.status(404).json({ ok: false, valid: false, message: 'Key không tồn tại' });
     if (!row.is_active) return res.status(403).json({ ok: false, valid: false, message: 'Key đã bị thu hồi' });
@@ -255,10 +250,10 @@ adminRouter.post('/create-key', async (req, res) => {
       do {
         newKey = generateKey();
         if (++attempts > 10) throw new Error('Không sinh được key unique');
-        const { rows } = await pool.query('SELECT 1 FROM keys WHERE key_code = $1', [newKey]);
+        const { rows } = await pool.query('SELECT 1 FROM keys_nova WHERE key_code = $1', [newKey]);
         if (rows.length === 0) break;
       } while (true);
-      await pool.query(`INSERT INTO keys (key_code, label, duration_days, max_devices) VALUES ($1, $2, $3, $4)`, [newKey, label, duration_days, max_devices]);
+      await pool.query(`INSERT INTO keys_nova (key_code, label, duration_days, max_devices) VALUES ($1, $2, $3, $4)`, [newKey, label, duration_days, max_devices]);
       created.push(newKey);
     }
     res.json({ ok: true, keys: created });
@@ -279,9 +274,9 @@ adminRouter.get('/keys', async (req, res) => {
     if (status) whereParts.push(getStatusCondition(status));
     const whereClause = whereParts.length > 0 ? 'WHERE ' + whereParts.join(' AND ') : '';
 
-    const totalQ = await pool.query(`SELECT COUNT(*) AS c FROM keys ${whereClause}`, params);
+    const totalQ = await pool.query(`SELECT COUNT(*) AS c FROM keys_nova ${whereClause}`, params);
     const total = parseInt(totalQ.rows[0].c);
-    const rowsQ = await pool.query(`SELECT k.*, (SELECT COUNT(*) FROM devices d WHERE d.key_id = k.id) AS device_count FROM keys k ${whereClause} ORDER BY k.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`, [...params, limit, offset]);
+    const rowsQ = await pool.query(`SELECT k.*, (SELECT COUNT(*) FROM devices_nova d WHERE d.key_id = k.id) AS device_count FROM keys_nova k ${whereClause} ORDER BY k.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`, [...params, limit, offset]);
 
     res.json({ ok: true, total, page, limit, pages: Math.ceil(total / limit), keys: rowsQ.rows });
   } catch (e) { res.status(500).json({ ok: false, message: e.message }); }
@@ -289,11 +284,11 @@ adminRouter.get('/keys', async (req, res) => {
 
 adminRouter.get('/stats', async (req, res) => {
   try {
-    const totalQ = await pool.query('SELECT COUNT(*) AS c FROM keys');
-    const activeQ = await pool.query('SELECT COUNT(*) AS c FROM keys WHERE is_active = 1');
-    const usedQ = await pool.query('SELECT COUNT(*) AS c FROM keys WHERE used_count > 0');
-    const expiringQ = await pool.query(`SELECT COUNT(*) AS c FROM keys WHERE expires_at IS NOT NULL AND expires_at > EXTRACT(EPOCH FROM NOW()) AND expires_at < EXTRACT(EPOCH FROM NOW()) + 86400 * 7`);
-    const expiredQ = await pool.query(`SELECT COUNT(*) AS c FROM keys WHERE expires_at IS NOT NULL AND expires_at < EXTRACT(EPOCH FROM NOW())`);
+    const totalQ = await pool.query('SELECT COUNT(*) AS c FROM keys_nova');
+    const activeQ = await pool.query('SELECT COUNT(*) AS c FROM keys_nova WHERE is_active = 1');
+    const usedQ = await pool.query('SELECT COUNT(*) AS c FROM keys_nova WHERE used_count > 0');
+    const expiringQ = await pool.query(`SELECT COUNT(*) AS c FROM keys_nova WHERE expires_at IS NOT NULL AND expires_at > EXTRACT(EPOCH FROM NOW()) AND expires_at < EXTRACT(EPOCH FROM NOW()) + 86400 * 7`);
+    const expiredQ = await pool.query(`SELECT COUNT(*) AS c FROM keys_nova WHERE expires_at IS NOT NULL AND expires_at < EXTRACT(EPOCH FROM NOW())`);
 
     res.json({ ok: true, stats: { total: parseInt(totalQ.rows[0].c), active: parseInt(activeQ.rows[0].c), used: parseInt(usedQ.rows[0].c), expiring_soon: parseInt(expiringQ.rows[0].c), expired: parseInt(expiredQ.rows[0].c) } });
   } catch (e) { res.status(500).json({ ok: false, message: e.message }); }
@@ -301,7 +296,7 @@ adminRouter.get('/stats', async (req, res) => {
 
 adminRouter.post('/revoke', async (req, res) => {
   try {
-    const r = await pool.query('UPDATE keys SET is_active = 0 WHERE key_code = $1', [String(req.body?.key || '').toUpperCase()]);
+    const r = await pool.query('UPDATE keys_nova SET is_active = 0 WHERE key_code = $1', [String(req.body?.key || '').toUpperCase()]);
     if (r.rowCount === 0) return res.status(404).json({ ok: false, message: 'Không tìm thấy' });
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ ok: false, message: e.message }); }
@@ -309,7 +304,7 @@ adminRouter.post('/revoke', async (req, res) => {
 
 adminRouter.post('/unrevoke', async (req, res) => {
   try {
-    const r = await pool.query('UPDATE keys SET is_active = 1 WHERE key_code = $1', [String(req.body?.key || '').toUpperCase()]);
+    const r = await pool.query('UPDATE keys_nova SET is_active = 1 WHERE key_code = $1', [String(req.body?.key || '').toUpperCase()]);
     if (r.rowCount === 0) return res.status(404).json({ ok: false, message: 'Không tìm thấy' });
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ ok: false, message: e.message }); }
@@ -317,9 +312,9 @@ adminRouter.post('/unrevoke', async (req, res) => {
 
 adminRouter.post('/reset-devices', async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT id FROM keys WHERE key_code = $1', [String(req.body?.key || '').toUpperCase()]);
+    const { rows } = await pool.query('SELECT id FROM keys_nova WHERE key_code = $1', [String(req.body?.key || '').toUpperCase()]);
     if (!rows[0]) return res.status(404).json({ ok: false, message: 'Không tìm thấy' });
-    const r = await pool.query('DELETE FROM devices WHERE key_id = $1', [rows[0].id]);
+    const r = await pool.query('DELETE FROM devices_nova WHERE key_id = $1', [rows[0].id]);
     await logAction(rows[0].id, 'reset_devices', null, req.ip, `Xóa ${r.rowCount} thiết bị`);
     res.json({ ok: true, deleted: r.rowCount });
   } catch (e) { res.status(500).json({ ok: false, message: e.message }); }
@@ -327,16 +322,16 @@ adminRouter.post('/reset-devices', async (req, res) => {
 
 adminRouter.get('/devices/:key', async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT id FROM keys WHERE key_code = $1', [String(req.params.key || '').toUpperCase()]);
+    const { rows } = await pool.query('SELECT id FROM keys_nova WHERE key_code = $1', [String(req.params.key || '').toUpperCase()]);
     if (!rows[0]) return res.status(404).json({ ok: false, message: 'Không tìm thấy' });
-    const d = await pool.query('SELECT * FROM devices WHERE key_id = $1 ORDER BY first_seen ASC', [rows[0].id]);
+    const d = await pool.query('SELECT * FROM devices_nova WHERE key_id = $1 ORDER BY first_seen ASC', [rows[0].id]);
     res.json({ ok: true, devices: d.rows });
   } catch (e) { res.status(500).json({ ok: false, message: e.message }); }
 });
 
 adminRouter.delete('/delete', async (req, res) => {
   try {
-    const r = await pool.query('DELETE FROM keys WHERE key_code = $1', [String(req.body?.key || '').toUpperCase()]);
+    const r = await pool.query('DELETE FROM keys_nova WHERE key_code = $1', [String(req.body?.key || '').toUpperCase()]);
     if (r.rowCount === 0) return res.status(404).json({ ok: false, message: 'Không tìm thấy' });
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ ok: false, message: e.message }); }
@@ -347,21 +342,21 @@ adminRouter.post('/delete-batch', async (req, res) => {
   if (!Array.isArray(keys) || keys.length === 0) return res.status(400).json({ ok: false, message: 'Danh sách rỗng' });
   try {
     const clean = keys.map(k => String(k).toUpperCase());
-    const r = await pool.query('DELETE FROM keys WHERE key_code = ANY($1::text[])', [clean]);
+    const r = await pool.query('DELETE FROM keys_nova WHERE key_code = ANY($1::text[])', [clean]);
     res.json({ ok: true, deleted: r.rowCount });
   } catch (e) { res.status(500).json({ ok: false, message: e.message }); }
 });
 
 adminRouter.post('/delete-used', async (req, res) => {
   try {
-    const r = await pool.query('DELETE FROM keys WHERE used_count > 0');
+    const r = await pool.query('DELETE FROM keys_nova WHERE used_count > 0');
     res.json({ ok: true, deleted: r.rowCount });
   } catch (e) { res.status(500).json({ ok: false, message: e.message }); }
 });
 
 adminRouter.post('/delete-expired', async (req, res) => {
   try {
-    const r = await pool.query(`DELETE FROM keys WHERE expires_at IS NOT NULL AND expires_at < EXTRACT(EPOCH FROM NOW())`);
+    const r = await pool.query(`DELETE FROM keys_nova WHERE expires_at IS NOT NULL AND expires_at < EXTRACT(EPOCH FROM NOW())`);
     if (r.rowCount > 0) console.log(`🧹 Manual clean: Đã xóa ${r.rowCount} key hết hạn`);
     res.json({ ok: true, deleted: r.rowCount });
   } catch (e) { res.status(500).json({ ok: false, message: e.message }); }
@@ -372,12 +367,12 @@ adminRouter.get('/logs', async (req, res) => {
   try {
     let rows;
     if (req.query.key) {
-      const r = await pool.query('SELECT id FROM keys WHERE key_code = $1', [String(req.query.key).toUpperCase()]);
+      const r = await pool.query('SELECT id FROM keys_nova WHERE key_code = $1', [String(req.query.key).toUpperCase()]);
       if (!r.rows[0]) return res.json({ ok: true, logs: [] });
-      const l = await pool.query('SELECT * FROM logs WHERE key_id = $1 ORDER BY created_at DESC LIMIT $2', [r.rows[0].id, limit]);
+      const l = await pool.query('SELECT * FROM logs_nova WHERE key_id = $1 ORDER BY created_at DESC LIMIT $2', [r.rows[0].id, limit]);
       rows = l.rows;
     } else {
-      const l = await pool.query('SELECT * FROM logs ORDER BY created_at DESC LIMIT $1', [limit]);
+      const l = await pool.query('SELECT * FROM logs_nova ORDER BY created_at DESC LIMIT $1', [limit]);
       rows = l.rows;
     }
     res.json({ ok: true, logs: rows });
@@ -400,10 +395,10 @@ initDb()
   .then(() => {
     app.listen(PORT, () => {
       console.log('========================================');
-      console.log(`✅ Server chạy tại http://localhost:${PORT}`);
-      console.log(`✅ Version: 4.0.0 (FINAL)`);
+      console.log(`✅ NOVA Server chạy tại http://localhost:${PORT}`);
+      console.log(`✅ Version: 4.5.0 (Dùng bảng keys_nova)`);
       console.log(`✅ Device lock: BẬT CỨNG (mỗi key 1 máy)`);
-      console.log(`✅ Auto-clean: ĐÃ TẮT HOÀN TOÀN (Không bao giờ tự xóa key)`);
+      console.log(`✅ Auto-clean: ĐÃ TẮT (Không bao giờ tự xóa key)`);
       console.log('========================================');
     });
   })
