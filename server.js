@@ -216,7 +216,7 @@ app.post('/api/verify-key', verifyLimiter, async (req, res) => {
   const cleanKey = key.trim().toUpperCase();
 
   try {
-    const { rows } = await pool.query('SELECT * FROM keys WHERE key = $1', [cleanKey]);
+    const { rows } = await pool.query('SELECT * FROM keys WHERE key_code = $1', [cleanKey]);
     const row = rows[0];
 
     // === 1. Key không tồn tại ===
