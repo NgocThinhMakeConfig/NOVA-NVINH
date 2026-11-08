@@ -16,7 +16,7 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 const PORT = process.env.PORT || 10000;
 const JWT_SECRET = process.env.JWT_SECRET || 'default_secret_change_me';
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'admin123';
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'nvinhnova123';
 
 app.use(cors());
 app.use(express.json());
