@@ -1,8 +1,8 @@
 /* =========================================================
-   NVINH NOVA — KEY SERVER v5.5.0 (ULTIMATE ALL-IN-ONE)
-   - Có sẵn Web Admin tại: https://nova-nvinh.onrender.com/admin
-   - Có đầy đủ /api/admin/stats, /keys, /logs, /devices cho file HTML rời
-   - Chấp nhận mọi Header & không bao giờ báo lỗi 404 trong /api/admin
+   NVINH NOVA — KEY SERVER v5.6.0 (ULTIMATE & AUTO-FALLBACK)
+   - Tự động sinh device_id nếu app không truyền lên (Chống lỗi Database)
+   - Tích hợp sẵn trang Web Admin tại /admin
+   - Đầy đủ API cho mọi loại Panel / App Key
    ========================================================= */
 require('dotenv').config();
 const express = require('express');
@@ -16,7 +16,6 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 const JWT_SECRET = process.env.JWT_SECRET || 'default_secret_change_me';
 
-// Mật khẩu Admin: Luôn chấp nhận 'nvinhnova123' và các biến trên Render
 const VALID_ADMIN_SECRETS = new Set([
   'nvinhnova123',
   process.env.ADMIN_TOKEN ? process.env.ADMIN_TOKEN.trim() : null,
@@ -35,12 +34,8 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.set('trust proxy', 1);
 
-// Tự động gộp dấu '//' và in log mọi request gọi tới server để dễ kiểm tra
 app.use((req, res, next) => {
   req.url = req.url.replace(/\/+/g, '/');
-  if (req.url !== '/health') {
-    console.log(`📡 [${req.method}] ${req.url}`);
-  }
   next();
 });
 
@@ -127,7 +122,7 @@ async function logAction(keyId, action, deviceId, ip, detail) {
   try {
     await pool.query(
       `INSERT INTO logs_nova (key_id, action, device_id, ip, detail) VALUES ($1, $2, $3, $4, $5)`,
-      [keyId, action, deviceId, ip, detail]
+      [keyId, action, deviceId || 'UNKNOWN', ip, detail]
     );
   } catch (_) {}
 }
@@ -151,7 +146,7 @@ function extractAdminSecret(req) {
   return '';
 }
 
-const verifyLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 150 });
+const verifyLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 200 });
 
 function requireToken(req, res, next) {
   const authHeader = req.headers.authorization;
@@ -167,7 +162,6 @@ function requireToken(req, res, next) {
 function requireAdmin(req, res, next) {
   const providedSecret = extractAdminSecret(req);
   if (!providedSecret || !VALID_ADMIN_SECRETS.has(providedSecret)) {
-    console.warn(`❌ Sai mật khẩu Admin. Nhận được: "${providedSecret}"`);
     return res.status(403).json({ ok: false, message: 'Quyền truy cập Admin bị từ chối' });
   }
   next();
@@ -218,7 +212,7 @@ const ADMIN_HTML_PAGE = `<!DOCTYPE html>
 <body>
   <header>
     <div class="brand">N VINH NOVA <span>ADMIN</span></div>
-    <div class="status-badge">• SERVER ONLINE (v5.5)</div>
+    <div class="status-badge">• SERVER ONLINE (v5.6)</div>
   </header>
 
   <div id="loginView">
@@ -442,7 +436,6 @@ const ADMIN_HTML_PAGE = `<!DOCTYPE html>
 </body>
 </html>`;
 
-// Mở trang Web Admin trực tiếp tại /admin và /panel
 app.get('/admin', (req, res) => res.send(ADMIN_HTML_PAGE));
 app.get('/panel', (req, res) => res.send(ADMIN_HTML_PAGE));
 
@@ -451,8 +444,7 @@ const healthHandler = (req, res) => res.json({
   ok: true,
   status: 'online',
   service: 'NVINH NOVA',
-  version: '5.5.0',
-  table: 'keys_nova',
+  version: '5.6.0',
   admin_panel: 'https://nova-nvinh.onrender.com/admin',
   time: Date.now()
 });
@@ -461,15 +453,20 @@ app.get('/', healthHandler);
 app.get('/health', healthHandler);
 app.get('/api/health', healthHandler);
 app.get('/api/status', healthHandler);
-app.get('/api/ping', healthHandler);
 
+// API XÁC THỰC KEY (Đã tự động tạo device_id nếu client không gửi lên)
 app.post('/api/verify-key', verifyLimiter, async (req, res) => {
-  const { key, device_id: deviceId, user_agent: ua } = req.body || {};
+  let { key, device_id: deviceId, user_agent: ua } = req.body || {};
   const ip = req.ip;
   const now = Math.floor(Date.now() / 1000);
 
   if (!key) return res.status(400).json({ ok: false, valid: false, message: 'Thiếu key' });
   const cleanKey = String(key).trim().toUpperCase();
+
+  // Tự động sinh device_id tạm thời nếu app của khách không truyền lên để chống lỗi Database
+  if (!deviceId || deviceId === 'null' || deviceId === 'undefined') {
+    deviceId = 'AUTO-DEV-' + ip.replace(/[^a-zA-Z0-9]/g, '');
+  }
 
   try {
     const { rows } = await pool.query('SELECT * FROM keys_nova WHERE key_code = $1', [cleanKey]);
@@ -488,7 +485,7 @@ app.post('/api/verify-key', verifyLimiter, async (req, res) => {
     if (!isKnown) {
       if (devs.length >= row.max_devices) {
         await logAction(row.id, 'verify_fail', deviceId, ip, 'Vượt số thiết bị');
-        return res.status(403).json({ ok: false, valid: false, message: `Key đã kích hoạt trên ${row.max_devices} thiết bị khác.` });
+        return res.status(403).json({ ok: false, valid: false, message: `Key đã kích hoạt tối đa ${row.max_devices} thiết bị.` });
       }
       await pool.query(
         `INSERT INTO devices_nova (key_id, device_id, user_agent, ip) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`,
@@ -512,6 +509,7 @@ app.post('/api/verify-key', verifyLimiter, async (req, res) => {
     const token = signToken({ keyId: row.id, key_code: row.key_code, deviceId });
     res.json({ ok: true, valid: true, message: 'Xác thực thành công', token, expires_at: expires_at ? expires_at * 1000 : null });
   } catch (err) {
+    console.error('Verify Error:', err);
     res.status(500).json({ ok: false, valid: false, message: 'Lỗi Server: ' + err.message });
   }
 });
@@ -563,7 +561,6 @@ const statsHandler = async (req, res) => {
 
 adminRouter.get('/stats', statsHandler);
 adminRouter.get('/dashboard', statsHandler);
-adminRouter.get('/overview', statsHandler);
 adminRouter.all('/login', statsHandler);
 adminRouter.all('/verify', statsHandler);
 
@@ -659,7 +656,6 @@ const revokeHandler = async (req, res) => {
   } catch (err) { res.status(500).json({ ok: false, message: err.message }); }
 };
 adminRouter.post('/revoke', revokeHandler);
-adminRouter.post('/revoke-key', revokeHandler);
 adminRouter.post('/lock', revokeHandler);
 
 const activateHandler = async (req, res) => {
@@ -670,7 +666,6 @@ const activateHandler = async (req, res) => {
   } catch (err) { res.status(500).json({ ok: false, message: err.message }); }
 };
 adminRouter.post('/activate', activateHandler);
-adminRouter.post('/unrevoke', activateHandler);
 adminRouter.post('/unlock', activateHandler);
 
 const resetDevicesHandler = async (req, res) => {
@@ -683,7 +678,6 @@ const resetDevicesHandler = async (req, res) => {
   } catch (err) { res.status(500).json({ ok: false, message: err.message }); }
 };
 adminRouter.post('/reset-devices', resetDevicesHandler);
-adminRouter.post('/reset-hwid', resetDevicesHandler);
 adminRouter.post('/reset', resetDevicesHandler);
 
 const deleteKeyHandler = async (req, res) => {
@@ -695,21 +689,18 @@ const deleteKeyHandler = async (req, res) => {
 };
 adminRouter.delete('/delete', deleteKeyHandler);
 adminRouter.post('/delete', deleteKeyHandler);
-adminRouter.post('/delete-key', deleteKeyHandler);
-adminRouter.delete('/keys/:key', deleteKeyHandler);
 
 app.use('/api/admin', adminRouter);
 app.use('/admin/api', adminRouter);
 
 app.use((req, res) => {
-  console.log(`⚠️ Route chưa có: ${req.method} ${req.originalUrl}`);
-  res.status(404).json({ ok: false, message: `Đường dẫn API không tồn tại: ${req.method} ${req.originalUrl}` });
+  res.status(404).json({ ok: false, message: `Đường dẫn không tồn tại: ${req.method} ${req.originalUrl}` });
 });
 
 initDb()
   .then(() => {
     app.listen(PORT, '0.0.0.0', () => {
-      console.log(`✅ NOVA Server v5.5.0 đang chạy tại http://0.0.0.0:${PORT}`);
+      console.log(`✅ NOVA Server v5.6.0 đang chạy tại http://0.0.0.0:${PORT}`);
       console.log(`👉 Truy cập Web Admin tại: https://nova-nvinh.onrender.com/admin`);
     });
   })
