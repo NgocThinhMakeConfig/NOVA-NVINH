@@ -1,8 +1,8 @@
 /* =========================================================
-   NVINH NOVA — KEY SERVER v5.0.0 (STABLE & PRODUCTION READY)
-   - Khắc phục lỗi bind port trên Render (0.0.0.0)
+   NVINH NOVA — KEY SERVER v5.1.0 (STABLE & PRODUCTION READY)
+   - Tương thích 100% với Panel HTML mở trực tiếp (file://)
+   - Hỗ trợ đa phương thức xác thực Admin (Bearer, Header, Body, Query)
    - Quản lý Database an toàn, không bao giờ DROP TABLE
-   - Tối ưu Connection Pool cho việc dùng chung DB
    - Bắt lỗi Runtime toàn cục (không bị crash đột ngột)
    ========================================================= */
 require('dotenv').config();
@@ -10,35 +10,58 @@ const express = require('express');
 const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
+const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 
 // --- CẤU HÌNH CƠ BẢN ---
 const app = express();
 const PORT = process.env.PORT || 10000;
 const JWT_SECRET = process.env.JWT_SECRET || 'default_secret_change_me';
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'nvinhnova123';
 
-app.use(cors());
+// Chấp nhận cả ADMIN_TOKEN, ADMIN_SECRET trên Render và luôn cho phép 'nvinhnova123'
+const VALID_ADMIN_Secrets = new Set([
+  'nvinhnova123',
+  process.env.ADMIN_TOKEN ? process.env.ADMIN_TOKEN.trim() : null,
+  process.env.ADMIN_SECRET ? process.env.ADMIN_SECRET.trim() : null,
+  process.env.ADMIN_PASSWORD ? process.env.ADMIN_PASSWORD.trim() : null
+].filter(Boolean));
+
+// Cấu hình Helmet và CORS mở hoàn toàn cho phép gọi từ file:// trên máy tính
+app.use(helmet({
+  crossOriginResourcePolicy: false,
+  contentSecurityPolicy: false
+}));
+
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-token', 'x-admin-secret', 'admin-secret']
+}));
+
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 app.set('trust proxy', 1); // Cần thiết khi chạy sau Proxy của Render
 
 // --- CẤU HÌNH DATABASE POOL ---
-// Giới hạn max: 20 để tránh sập DB khi dùng chung với project AIMLOCK
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes('render.com') 
-       ? { rejectUnauthorized: false } : false,
-  max: 20, 
+  ssl: process.env.DATABASE_URL && (process.env.DATABASE_URL.includes('render.com') || process.env.NODE_ENV === 'production')
+       ? { rejectUnauthorized: false }
+       : { rejectUnauthorized: false }, // An toàn cho cả internal/external DB trên Render
+  max: 20,
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
+  connectionTimeoutMillis: 5000,
+});
+
+pool.on('error', (err) => {
+  console.error('⚠️ Lỗi kết nối ngầm Database Pool (đã tự động xử lý):', err.message);
 });
 
 // --- HÀM KHỞI TẠO DATABASE (AN TOÀN) ---
 async function initDb() {
   try {
     console.log('⏳ Đang kiểm tra Database...');
-    
-    // Sử dụng IF NOT EXISTS để không bao giờ xóa dữ liệu cũ
+
     await pool.query(`
       CREATE TABLE IF NOT EXISTS keys_nova (
         id SERIAL PRIMARY KEY,
@@ -57,12 +80,12 @@ async function initDb() {
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS devices_nova (
-        id SERIAL PRIMARY KEY, 
+        id SERIAL PRIMARY KEY,
         key_id INTEGER NOT NULL REFERENCES keys_nova(id) ON DELETE CASCADE,
-        device_id TEXT NOT NULL, 
+        device_id TEXT NOT NULL,
         first_seen BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()),
-        last_seen BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()), 
-        user_agent TEXT, 
+        last_seen BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()),
+        user_agent TEXT,
         ip TEXT,
         UNIQUE(key_id, device_id)
       );
@@ -70,11 +93,11 @@ async function initDb() {
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS logs_nova (
-        id SERIAL PRIMARY KEY, 
+        id SERIAL PRIMARY KEY,
         key_id INTEGER REFERENCES keys_nova(id) ON DELETE SET NULL,
-        action TEXT NOT NULL, 
-        device_id TEXT, 
-        ip TEXT, 
+        action TEXT NOT NULL,
+        device_id TEXT,
+        ip TEXT,
         detail TEXT,
         created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())
       );
@@ -121,8 +144,34 @@ async function logAction(keyId, action, deviceId, ip, detail) {
   } catch (_) { /* Bỏ qua lỗi log để không ảnh hưởng luồng chính */ }
 }
 
+// Hàm lấy mã Admin từ mọi vị trí có thể trong Request
+function extractAdminSecret(req) {
+  const authHeader = req.headers.authorization || '';
+  if (authHeader.startsWith('Bearer ')) {
+    return authHeader.slice(7).trim();
+  }
+  if (authHeader.trim()) {
+    return authHeader.trim();
+  }
+  const customHeader = req.headers['x-admin-token'] || req.headers['x-admin-secret'] || req.headers['admin-secret'];
+  if (customHeader) return String(customHeader).trim();
+
+  if (req.body && (req.body.secret || req.body.admin_secret || req.body.token || req.body.password)) {
+    return String(req.body.secret || req.body.admin_secret || req.body.token || req.body.password).trim();
+  }
+  if (req.query && (req.query.secret || req.query.admin_secret || req.query.token)) {
+    return String(req.query.secret || req.query.admin_secret || req.query.token).trim();
+  }
+  return '';
+}
+
 /* ---------- MIDDLEWARES ---------- */
-const verifyLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 });
+const verifyLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 150,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 function requireToken(req, res, next) {
   const authHeader = req.headers.authorization;
@@ -137,30 +186,44 @@ function requireToken(req, res, next) {
 }
 
 function requireAdmin(req, res, next) {
-  const authHeader = req.headers.authorization;
-  if (authHeader !== `Bearer ${ADMIN_TOKEN}`) {
+  const providedSecret = extractAdminSecret(req);
+  if (!providedSecret || !VALID_ADMIN_Secrets.has(providedSecret)) {
+    console.warn(`⚠️ Từ chối đăng nhập Admin. Mã nhận được: "${providedSecret}"`);
     return res.status(403).json({ ok: false, message: 'Quyền truy cập Admin bị từ chối' });
   }
   next();
 }
 
 /* ---------- PUBLIC ROUTES ---------- */
-app.get('/', (req, res) => res.json({ ok: true, service: 'NVINH NOVA', version: '5.0.0', table: 'keys_nova', time: Date.now() }));
-app.get('/health', (req, res) => res.json({ ok: true, time: Date.now() }));
+app.get('/', (req, res) => res.json({
+  ok: true,
+  status: 'online',
+  service: 'NVINH NOVA',
+  version: '5.1.0',
+  table: 'keys_nova',
+  time: Date.now()
+}));
+
+app.get('/health', (req, res) => res.json({ ok: true, status: 'online', time: Date.now() }));
+app.get('/api/health', (req, res) => res.json({ ok: true, status: 'online', time: Date.now() }));
+app.get('/api/status', (req, res) => res.json({ ok: true, status: 'online', time: Date.now() }));
 
 app.post('/api/verify-key', verifyLimiter, async (req, res) => {
-  const { key, device_id: deviceId, user_agent: ua } = req.body;
+  const { key, device_id: deviceId, user_agent: ua } = req.body || {};
   const ip = req.ip;
   const now = Math.floor(Date.now() / 1000);
 
   if (!key) return res.status(400).json({ ok: false, valid: false, message: 'Thiếu key' });
-  const cleanKey = key.trim().toUpperCase();
+  const cleanKey = String(key).trim().toUpperCase();
 
   try {
     const { rows } = await pool.query('SELECT * FROM keys_nova WHERE key_code = $1', [cleanKey]);
     const row = rows[0];
 
-    if (!row) { await logAction(null, 'verify_fail', deviceId, ip, 'Key không tồn tại'); return res.status(404).json({ ok: false, valid: false, message: 'Key không tồn tại' }); }
+    if (!row) {
+      await logAction(null, 'verify_fail', deviceId, ip, 'Key không tồn tại');
+      return res.status(404).json({ ok: false, valid: false, message: 'Key không tồn tại' });
+    }
     if (!row.is_active) return res.status(403).json({ ok: false, valid: false, message: 'Key đã bị thu hồi' });
     if (row.expires_at && now > row.expires_at) return res.status(403).json({ ok: false, valid: false, message: 'Key đã hết hạn' });
 
@@ -174,7 +237,10 @@ app.post('/api/verify-key', verifyLimiter, async (req, res) => {
         await logAction(row.id, 'verify_fail', deviceId, ip, `Vượt số thiết bị`);
         return res.status(403).json({ ok: false, valid: false, message: `Key đã kích hoạt trên ${row.max_devices} thiết bị khác.` });
       }
-      await pool.query(`INSERT INTO devices_nova (key_id, device_id, user_agent, ip) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`, [row.id, deviceId, ua, ip]);
+      await pool.query(
+        `INSERT INTO devices_nova (key_id, device_id, user_agent, ip) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`,
+        [row.id, deviceId, ua || '', ip]
+      );
       await logAction(row.id, 'device_new', deviceId, ip, `Thiết bị mới #${devs.length + 1}`);
     } else {
       await pool.query('UPDATE devices_nova SET last_seen = $1 WHERE key_id = $2 AND device_id = $3', [now, row.id, deviceId]);
@@ -191,7 +257,7 @@ app.post('/api/verify-key', verifyLimiter, async (req, res) => {
     await logAction(row.id, 'verify_ok', deviceId, ip, 'Xác thực thành công');
 
     const token = signToken({ keyId: row.id, key_code: row.key_code, deviceId: deviceId });
-    res.json({ ok: true, valid: true, message: 'Xác thực thành công', token, expires_at: expires_at * 1000 });
+    res.json({ ok: true, valid: true, message: 'Xác thực thành công', token, expires_at: expires_at ? expires_at * 1000 : null });
   } catch (err) {
     console.error('Verify Error:', err);
     res.status(500).json({ ok: false, valid: false, message: 'Lỗi Server' });
@@ -203,7 +269,7 @@ app.post('/api/heartbeat', requireToken, async (req, res) => {
     const { rows } = await pool.query('SELECT * FROM keys_nova WHERE id = $1', [req.user.keyId]);
     const row = rows[0];
     if (!row || !row.is_active) return res.status(403).json({ ok: false, valid: false, message: 'Key bị khóa hoặc không tồn tại' });
-    
+
     const now = Math.floor(Date.now() / 1000);
     if (row.expires_at && now > row.expires_at) return res.status(403).json({ ok: false, valid: false, message: 'Key đã hết hạn' });
 
@@ -217,39 +283,57 @@ app.post('/api/heartbeat', requireToken, async (req, res) => {
 const adminRouter = express.Router();
 adminRouter.use(requireAdmin);
 
+// Các route kiểm tra đăng nhập Admin từ Panel HTML
+adminRouter.get('/verify', (req, res) => res.json({ ok: true, message: 'Admin hợp lệ' }));
+adminRouter.post('/verify', (req, res) => res.json({ ok: true, message: 'Admin hợp lệ' }));
+adminRouter.post('/login', (req, res) => res.json({ ok: true, message: 'Đăng nhập Admin thành công' }));
+
+// Tạo Key mới
 adminRouter.post('/create-key', async (req, res) => {
-  const { label = '', duration_days = 0, max_devices = 1, amount = 1 } = req.body;
+  const { label = '', duration_days = 0, max_devices = 1, amount = 1, custom_key = '' } = req.body || {};
   try {
+    const numAmount = Math.min(Math.max(parseInt(amount) || 1, 1), 100);
+    const numDuration = Math.max(parseInt(duration_days) || 0, 0);
+    const numDevices = Math.max(parseInt(max_devices) || 1, 1);
+
     let created = [];
-    for (let i = 0; i < amount; i++) {
-      let newKey, attempts = 0;
-      do {
-        newKey = generateKey();
-        const { rows } = await pool.query('SELECT 1 FROM keys_nova WHERE key_code = $1', [newKey]);
-        if (rows.length === 0) break;
-      } while (++attempts < 10);
-      
-      await pool.query(`INSERT INTO keys_nova (key_code, label, duration_days, max_devices) VALUES ($1, $2, $3, $4)`, [newKey, label, duration_days, max_devices]);
+    for (let i = 0; i < numAmount; i++) {
+      let newKey = (numAmount === 1 && custom_key) ? String(custom_key).trim().toUpperCase() : '';
+
+      if (!newKey) {
+        let attempts = 0;
+        do {
+          newKey = generateKey();
+          const { rows } = await pool.query('SELECT 1 FROM keys_nova WHERE key_code = $1', [newKey]);
+          if (rows.length === 0) break;
+        } while (++attempts < 10);
+      }
+
+      await pool.query(
+        `INSERT INTO keys_nova (key_code, label, duration_days, max_devices) VALUES ($1, $2, $3, $4)`,
+        [newKey, label, numDuration, numDevices]
+      );
       created.push(newKey);
     }
-    res.json({ ok: true, keys: created });
+    res.json({ ok: true, keys: created, key: created[0] });
   } catch (err) {
     res.status(500).json({ ok: false, message: err.message });
   }
 });
 
+// Lấy danh sách Key & Thống kê
 adminRouter.get('/keys', async (req, res) => {
   try {
-    const limit = parseInt(req.query.limit) || 50;
-    const page = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+    const page = Math.max(parseInt(req.query.page) || 1, 1);
     const offset = (page - 1) * limit;
 
     const totalQ = await pool.query('SELECT COUNT(*) AS c FROM keys_nova');
     const total = parseInt(totalQ.rows[0].c);
-    
+
     const rowsQ = await pool.query(`
-      SELECT k.*, (SELECT COUNT(*) FROM devices_nova d WHERE d.key_id = k.id) AS device_count 
-      FROM keys_nova k 
+      SELECT k.*, (SELECT COUNT(*)::int FROM devices_nova d WHERE d.key_id = k.id) AS device_count
+      FROM keys_nova k
       ORDER BY k.created_at DESC LIMIT $1 OFFSET $2
     `, [limit, offset]);
 
@@ -259,30 +343,64 @@ adminRouter.get('/keys', async (req, res) => {
   }
 });
 
+// Thu hồi (Khóa) Key
 adminRouter.post('/revoke', async (req, res) => {
   try {
-    const r = await pool.query('UPDATE keys_nova SET is_active = 0 WHERE key_code = $1', [String(req.body?.key || '').toUpperCase()]);
+    const targetKey = String(req.body?.key || req.body?.key_code || '').trim().toUpperCase();
+    const r = await pool.query('UPDATE keys_nova SET is_active = 0 WHERE key_code = $1', [targetKey]);
     res.json({ ok: true, modified: r.rowCount });
-  } catch (err) { res.status(500).json({ ok: false, message: err.message }); }
+  } catch (err) {
+    res.status(500).json({ ok: false, message: err.message });
+  }
 });
 
-adminRouter.delete('/delete', async (req, res) => {
+// Mở khóa lại Key (Unrevoke)
+adminRouter.post('/activate', async (req, res) => {
   try {
-    const r = await pool.query('DELETE FROM keys_nova WHERE key_code = $1', [String(req.body?.key || '').toUpperCase()]);
-    res.json({ ok: true, deleted: r.rowCount });
-  } catch (err) { res.status(500).json({ ok: false, message: err.message }); }
+    const targetKey = String(req.body?.key || req.body?.key_code || '').trim().toUpperCase();
+    const r = await pool.query('UPDATE keys_nova SET is_active = 1 WHERE key_code = $1', [targetKey]);
+    res.json({ ok: true, modified: r.rowCount });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: err.message });
+  }
 });
+
+// Reset thiết bị của Key
+adminRouter.post('/reset-devices', async (req, res) => {
+  try {
+    const targetKey = String(req.body?.key || req.body?.key_code || '').trim().toUpperCase();
+    const { rows } = await pool.query('SELECT id FROM keys_nova WHERE key_code = $1', [targetKey]);
+    if (!rows[0]) return res.status(404).json({ ok: false, message: 'Không tìm thấy key' });
+
+    const r = await pool.query('DELETE FROM devices_nova WHERE key_id = $1', [rows[0].id]);
+    res.json({ ok: true, reset: r.rowCount, message: 'Đã reset thiết bị thành công' });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+// Xóa Key (Hỗ trợ cả DELETE và POST để tránh lỗi từ các bản HTML khác nhau)
+const handleDeleteKey = async (req, res) => {
+  try {
+    const targetKey = String(req.body?.key || req.body?.key_code || req.query?.key || '').trim().toUpperCase();
+    const r = await pool.query('DELETE FROM keys_nova WHERE key_code = $1', [targetKey]);
+    res.json({ ok: true, deleted: r.rowCount });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: err.message });
+  }
+};
+adminRouter.delete('/delete', handleDeleteKey);
+adminRouter.post('/delete', handleDeleteKey);
 
 app.use('/api/admin', adminRouter);
 
 /* ---------- KHỞI ĐỘNG SERVER ---------- */
 initDb()
   .then(() => {
-    // QUAN TRỌNG: Bind vào 0.0.0.0 để Render có thể truy cập
     app.listen(PORT, '0.0.0.0', () => {
       console.log('========================================');
       console.log(`✅ NOVA Server đang chạy tại http://0.0.0.0:${PORT}`);
-      console.log(`✅ Version: 5.0.0 (Stable)`);
+      console.log(`✅ Version: 5.1.0 (Stable)`);
       console.log('========================================');
     });
   })
@@ -294,4 +412,8 @@ initDb()
 // Bắt các lỗi không mong muốn để server không bị crash đột ngột
 process.on('unhandledRejection', (err) => {
   console.error('🔥 Unhandled Rejection:', err);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('🔥 Uncaught Exception:', err);
 });
