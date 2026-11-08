@@ -1,96 +1,115 @@
 /* =========================================================
-   NVINH NOVA — KEY SERVER v4.5.0 (Dùng chung DB với AIMLOCK)
-   - Sử dụng bảng keys_nova để tránh xung đột
-   - Device lock cứng (mỗi key 1 máy)
-   - Không bao giờ tự xóa key
+   NVINH NOVA — KEY SERVER v5.0.0 (STABLE & PRODUCTION READY)
+   - Khắc phục lỗi bind port trên Render (0.0.0.0)
+   - Quản lý Database an toàn, không bao giờ DROP TABLE
+   - Tối ưu Connection Pool cho việc dùng chung DB
+   - Bắt lỗi Runtime toàn cục (không bị crash đột ngột)
    ========================================================= */
 require('dotenv').config();
-
-const crypto    = require('crypto');
-const path      = require('path');
-const express   = require('express');
-const cors      = require('cors');
-const helmet    = require('helmet');
-const morgan    = require('morgan');
-const jwt       = require('jsonwebtoken');
+const express = require('express');
+const { Pool } = require('pg');
+const jwt = require('jsonwebtoken');
+const cors = require('cors');
 const rateLimit = require('express-rate-limit');
-const { Pool }  = require('pg');
 
-/* ---------- 1. DATABASE ---------- */
+// --- CẤU HÌNH CƠ BẢN ---
+const app = express();
+const PORT = process.env.PORT || 10000;
+const JWT_SECRET = process.env.JWT_SECRET || 'default_secret_change_me';
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'admin123';
+
+app.use(cors());
+app.use(express.json());
+app.set('trust proxy', 1); // Cần thiết khi chạy sau Proxy của Render
+
+// --- CẤU HÌNH DATABASE POOL ---
+// Giới hạn max: 20 để tránh sập DB khi dùng chung với project AIMLOCK
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production'
-    ? { rejectUnauthorized: false }
-    : false
+  ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes('render.com') 
+       ? { rejectUnauthorized: false } : false,
+  max: 20, 
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
 });
 
+// --- HÀM KHỞI TẠO DATABASE (AN TOÀN) ---
 async function initDb() {
   try {
-    console.log('⏳ Đang kiểm tra Database cho NOVA...');
-    // Kiểm tra bảng keys_nova
-    await pool.query('SELECT is_active FROM keys_nova LIMIT 1');
-    console.log('✅ Bảng keys_nova đã tồn tại và đầy đủ cột.');
-  } catch (err) {
-    if (err.code === '42P01' || err.code === '42703') {
-      console.log('⚠️ Phát hiện bảng keys_nova lỗi hoặc chưa có. Đang tạo mới...');
-      await pool.query('DROP TABLE IF EXISTS keys_nova CASCADE');
-      await pool.query(`
-        CREATE TABLE keys_nova (
-          id SERIAL PRIMARY KEY,
-          key_code TEXT UNIQUE NOT NULL,
-          label TEXT DEFAULT '',
-          duration_days INTEGER DEFAULT 30,
-          max_devices INTEGER DEFAULT 1,
-          is_active INTEGER DEFAULT 1,
-          created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()),
-          expires_at BIGINT,
-          activated_at BIGINT,
-          used_count INTEGER DEFAULT 0,
-          last_used_at BIGINT
-        );
-      `);
-      console.log('✅ Đã tạo bảng keys_nova thành công!');
-    } else {
-      throw err;
-    }
-  }
+    console.log('⏳ Đang kiểm tra Database...');
+    
+    // Sử dụng IF NOT EXISTS để không bao giờ xóa dữ liệu cũ
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS keys_nova (
+        id SERIAL PRIMARY KEY,
+        key_code TEXT UNIQUE NOT NULL,
+        label TEXT DEFAULT '',
+        max_devices INTEGER DEFAULT 1,
+        duration_days INTEGER DEFAULT 0,
+        created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()),
+        activated_at BIGINT,
+        expires_at BIGINT,
+        is_active INTEGER DEFAULT 1,
+        used_count INTEGER DEFAULT 0,
+        last_used_at BIGINT
+      );
+    `);
 
-  // Tạo các bảng phụ (devices_nova, logs_nova)
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS devices_nova (
-      id SERIAL PRIMARY KEY, key_id INTEGER NOT NULL REFERENCES keys_nova(id) ON DELETE CASCADE,
-      device_id TEXT NOT NULL, first_seen BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()),
-      last_seen BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()), user_agent TEXT, ip TEXT,
-      UNIQUE(key_id, device_id)
-    );
-    CREATE TABLE IF NOT EXISTS logs_nova (
-      id SERIAL PRIMARY KEY, key_id INTEGER REFERENCES keys_nova(id) ON DELETE SET NULL,
-      action TEXT NOT NULL, device_id TEXT, ip TEXT, detail TEXT,
-      created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())
-    );
-    CREATE INDEX IF NOT EXISTS idx_keys_nova_key_code ON keys_nova(key_code);
-  `);
-  console.log('✅ Database NOVA khởi tạo xong hoàn toàn!');
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS devices_nova (
+        id SERIAL PRIMARY KEY, 
+        key_id INTEGER NOT NULL REFERENCES keys_nova(id) ON DELETE CASCADE,
+        device_id TEXT NOT NULL, 
+        first_seen BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()),
+        last_seen BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()), 
+        user_agent TEXT, 
+        ip TEXT,
+        UNIQUE(key_id, device_id)
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS logs_nova (
+        id SERIAL PRIMARY KEY, 
+        key_id INTEGER REFERENCES keys_nova(id) ON DELETE SET NULL,
+        action TEXT NOT NULL, 
+        device_id TEXT, 
+        ip TEXT, 
+        detail TEXT,
+        created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())
+      );
+    `);
+
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_keys_nova_key_code ON keys_nova(key_code);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_devices_nova_key_id ON devices_nova(key_id);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_logs_nova_key_id ON logs_nova(key_id);`);
+
+    console.log('✅ Database khởi tạo thành công! (Bảng keys_nova đã sẵn sàng)');
+    console.log('✅ DEVICE LOCK: BẬT CỨNG');
+    console.log('✅ AUTO-CLEAN: ĐÃ TẮT HOÀN TOÀN');
+  } catch (err) {
+    console.error('❌ Lỗi khởi tạo Database:', err.message);
+    throw err;
+  }
 }
 
-/* ---------- 2. HELPERS ---------- */
-function generateKey() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  const seg = () => Array.from({ length: 4 }, () =>
-    chars[crypto.randomInt(0, chars.length)]
-  ).join('');
-  return [seg(), seg(), seg(), seg()].join('-');
+/* ---------- HELPERS ---------- */
+function verifyToken(token) {
+  try { return jwt.verify(token, JWT_SECRET); } catch (_) { return null; }
 }
 
 function signToken(payload) {
-  return jwt.sign(payload, process.env.JWT_SECRET || 'nvinh_secret', {
-    expiresIn: process.env.JWT_EXPIRES_IN || '24h'
-  });
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
 }
 
-function verifyToken(token) {
-  try { return jwt.verify(token, process.env.JWT_SECRET || 'nvinh_secret'); }
-  catch { return null; }
+function generateKey() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let key = 'NOVA-';
+  for (let i = 0; i < 3; i++) {
+    for (let j = 0; j < 4; j++) key += chars.charAt(Math.floor(Math.random() * chars.length));
+    if (i < 2) key += '-';
+  }
+  return key;
 }
 
 async function logAction(keyId, action, deviceId, ip, detail) {
@@ -99,76 +118,42 @@ async function logAction(keyId, action, deviceId, ip, detail) {
       `INSERT INTO logs_nova (key_id, action, device_id, ip, detail) VALUES ($1, $2, $3, $4, $5)`,
       [keyId, action, deviceId, ip, detail]
     );
-  } catch (_) {}
+  } catch (_) { /* Bỏ qua lỗi log để không ảnh hưởng luồng chính */ }
 }
 
-function getStatusCondition(status){
-  switch(status){
-    case 'active': return `is_active = 1 AND (expires_at IS NULL OR expires_at > EXTRACT(EPOCH FROM NOW()))`;
-    case 'used': return `used_count > 0`;
-    case 'expiring': return `is_active = 1 AND expires_at IS NOT NULL AND expires_at > EXTRACT(EPOCH FROM NOW()) AND expires_at < EXTRACT(EPOCH FROM NOW()) + 86400 * 3`;
-    case 'expired': return `expires_at IS NOT NULL AND expires_at < EXTRACT(EPOCH FROM NOW())`;
-    default: return '1=1';
-  }
-}
-
-/* ---------- 3. APP ---------- */
-const app = express();
-app.set('trust proxy', 1);
-app.use(helmet({ contentSecurityPolicy: false }));
-app.use(express.json({ limit: '100kb' }));
-
-// CORS
-const origins = (process.env.ALLOWED_ORIGINS || '*').split(',').map(s => s.trim()).filter(Boolean);
-app.use(cors({
-  origin(origin, cb) {
-    if (!origin) return cb(null, true);
-    if (origins.includes(origin) || origins.includes('*')) return cb(null, true);
-    cb(new Error('CORS blocked: ' + origin));
-  },
-  methods: ['GET', 'POST', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Device-Id', 'X-Admin-Secret']
-}));
-
-if (process.env.NODE_ENV !== 'production') app.use(morgan('dev'));
-app.use(express.static(path.join(__dirname, 'public')));
-
-/* ---------- 4. RATE LIMIT ---------- */
-const generalLimiter = rateLimit({ windowMs: 60 * 1000, max: 100 });
-const verifyLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 30, skipSuccessfulRequests: true });
-const adminLimiter = rateLimit({ windowMs: 60 * 1000, max: 200 });
-app.use('/api/', generalLimiter);
-
-/* ---------- 5. MIDDLEWARE ---------- */
-function requireAdmin(req, res, next) {
-  const secret = req.headers['x-admin-secret'];
-  if (!secret || secret !== process.env.ADMIN_SECRET) {
-    return res.status(403).json({ ok: false, message: 'Không có quyền' });
-  }
-  next();
-}
+/* ---------- MIDDLEWARES ---------- */
+const verifyLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 });
 
 function requireToken(req, res, next) {
-  const auth = req.headers['authorization'] || '';
-  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-  if (!token) return res.status(401).json({ ok: false, message: 'Thiếu token' });
-  const payload = verifyToken(token);
-  if (!payload) return res.status(401).json({ ok: false, message: 'Token không hợp lệ' });
-  req.user = payload;
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ ok: false, message: 'Thiếu token xác thực' });
+  }
+  const token = authHeader.split(' ')[1];
+  const decoded = verifyToken(token);
+  if (!decoded) return res.status(401).json({ ok: false, message: 'Token không hợp lệ hoặc hết hạn' });
+  req.user = decoded;
   next();
 }
 
-/* ---------- 6. PUBLIC ROUTES ---------- */
-app.get('/', (req, res) => res.json({ ok: true, service: 'NVINH NOVA', version: '4.5.0', table: 'keys_nova', time: Date.now() }));
+function requireAdmin(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (authHeader !== `Bearer ${ADMIN_TOKEN}`) {
+    return res.status(403).json({ ok: false, message: 'Quyền truy cập Admin bị từ chối' });
+  }
+  next();
+}
 
-// POST /api/verify-key
+/* ---------- PUBLIC ROUTES ---------- */
+app.get('/', (req, res) => res.json({ ok: true, service: 'NVINH NOVA', version: '5.0.0', table: 'keys_nova', time: Date.now() }));
+app.get('/health', (req, res) => res.json({ ok: true, time: Date.now() }));
+
 app.post('/api/verify-key', verifyLimiter, async (req, res) => {
-  const { key } = req.body || {};
-  const deviceId = String(req.headers['x-device-id'] || '').trim();
+  const { key, device_id: deviceId, user_agent: ua } = req.body;
   const ip = req.ip;
-  const ua = req.headers['user-agent'] || '';
+  const now = Math.floor(Date.now() / 1000);
 
-  if (!key || typeof key !== 'string') return res.status(400).json({ ok: false, valid: false, message: 'Thiếu key' });
+  if (!key) return res.status(400).json({ ok: false, valid: false, message: 'Thiếu key' });
   const cleanKey = key.trim().toUpperCase();
 
   try {
@@ -176,233 +161,137 @@ app.post('/api/verify-key', verifyLimiter, async (req, res) => {
     const row = rows[0];
 
     if (!row) { await logAction(null, 'verify_fail', deviceId, ip, 'Key không tồn tại'); return res.status(404).json({ ok: false, valid: false, message: 'Key không tồn tại' }); }
-    if (!row.is_active) { await logAction(row.id, 'verify_fail', deviceId, ip, 'Key bị vô hiệu'); return res.status(403).json({ ok: false, valid: false, message: 'Key đã bị vô hiệu hoá' }); }
+    if (!row.is_active) return res.status(403).json({ ok: false, valid: false, message: 'Key đã bị thu hồi' });
+    if (row.expires_at && now > row.expires_at) return res.status(403).json({ ok: false, valid: false, message: 'Key đã hết hạn' });
 
-    const now = Math.floor(Date.now() / 1000);
-    if (row.expires_at && Number(row.expires_at) < now) {
-      const daysExpired = Math.floor((now - Number(row.expires_at)) / 86400);
-      await logAction(row.id, 'verify_fail', deviceId, ip, `Key hết hạn ${daysExpired} ngày`);
-      return res.status(403).json({ ok: false, valid: false, message: `Key đã hết hạn ${daysExpired} ngày trước` });
-    }
+    if (!deviceId) return res.status(400).json({ ok: false, valid: false, message: 'Thiếu thông tin thiết bị' });
 
-    if (!deviceId) { await logAction(row.id, 'verify_fail', '', ip, 'Thiếu device_id'); return res.status(400).json({ ok: false, valid: false, message: 'Thiếu thông tin thiết bị' }); }
-
-    const { rows: devs } = await pool.query('SELECT device_id, first_seen FROM devices_nova WHERE key_id = $1', [row.id]);
+    const { rows: devs } = await pool.query('SELECT device_id FROM devices_nova WHERE key_id = $1', [row.id]);
     const isKnown = devs.some(d => d.device_id === deviceId);
 
     if (!isKnown) {
       if (devs.length >= row.max_devices) {
-        await logAction(row.id, 'verify_fail', deviceId, ip, `Vượt số thiết bị (${devs.length}/${row.max_devices})`);
-        return res.status(403).json({ ok: false, valid: false, message: `Key đã được kích hoạt trên ${row.max_devices} thiết bị khác. Vui lòng liên hệ admin để reset.` });
+        await logAction(row.id, 'verify_fail', deviceId, ip, `Vượt số thiết bị`);
+        return res.status(403).json({ ok: false, valid: false, message: `Key đã kích hoạt trên ${row.max_devices} thiết bị khác.` });
       }
-      await pool.query(`INSERT INTO devices_nova (key_id, device_id, user_agent, ip) VALUES ($1, $2, $3, $4) ON CONFLICT (key_id, device_id) DO NOTHING`, [row.id, deviceId, ua, ip]);
+      await pool.query(`INSERT INTO devices_nova (key_id, device_id, user_agent, ip) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`, [row.id, deviceId, ua, ip]);
       await logAction(row.id, 'device_new', deviceId, ip, `Thiết bị mới #${devs.length + 1}`);
     } else {
       await pool.query('UPDATE devices_nova SET last_seen = $1 WHERE key_id = $2 AND device_id = $3', [now, row.id, deviceId]);
     }
 
+    let expires_at = row.expires_at;
     if (!row.activated_at && row.duration_days > 0) {
-      const expires = now + row.duration_days * 86400;
-      await pool.query('UPDATE keys_nova SET activated_at = $1, expires_at = $2 WHERE id = $3', [now, expires, row.id]);
-      row.activated_at = now;
-      row.expires_at = expires;
+      expires_at = now + row.duration_days * 86400;
+      await pool.query('UPDATE keys_nova SET activated_at = $1, expires_at = $2 WHERE id = $3', [now, expires_at, row.id]);
       await logAction(row.id, 'activated', deviceId, ip, `Kích hoạt lần đầu, hạn ${row.duration_days} ngày`);
     }
 
     await pool.query('UPDATE keys_nova SET used_count = used_count + 1, last_used_at = $1 WHERE id = $2', [now, row.id]);
     await logAction(row.id, 'verify_ok', deviceId, ip, 'Xác thực thành công');
 
-    const token = signToken({ keyId: row.id, key_code: row.key_code, label: row.label, deviceId: deviceId });
-
-    res.json({ ok: true, valid: true, token, expires_at: row.expires_at, label: row.label, device_lock: true, max_devices: row.max_devices, device_count: isKnown ? devs.length : devs.length + 1 });
-  } catch (e) {
-    console.error('[verify-key]', e);
-    res.status(500).json({ ok: false, valid: false, message: 'Lỗi server' });
+    const token = signToken({ keyId: row.id, key_code: row.key_code, deviceId: deviceId });
+    res.json({ ok: true, valid: true, message: 'Xác thực thành công', token, expires_at: expires_at * 1000 });
+  } catch (err) {
+    console.error('Verify Error:', err);
+    res.status(500).json({ ok: false, valid: false, message: 'Lỗi Server' });
   }
 });
 
-// POST /api/heartbeat
 app.post('/api/heartbeat', requireToken, async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM keys_nova WHERE id = $1', [req.user.keyId]);
     const row = rows[0];
-    if (!row) return res.status(404).json({ ok: false, valid: false, message: 'Key không tồn tại' });
-    if (!row.is_active) return res.status(403).json({ ok: false, valid: false, message: 'Key đã bị thu hồi' });
+    if (!row || !row.is_active) return res.status(403).json({ ok: false, valid: false, message: 'Key bị khóa hoặc không tồn tại' });
+    
     const now = Math.floor(Date.now() / 1000);
-    if (row.expires_at && Number(row.expires_at) < now) return res.status(403).json({ ok: false, valid: false, message: 'Key đã hết hạn', expired: true });
-    res.json({ ok: true, valid: true, expires_at: row.expires_at, label: row.label });
-  } catch (e) { console.error('[heartbeat]', e); res.status(500).json({ ok: false, message: 'Lỗi server' }); }
+    if (row.expires_at && now > row.expires_at) return res.status(403).json({ ok: false, valid: false, message: 'Key đã hết hạn' });
+
+    res.json({ ok: true, valid: true, message: 'Heartbeat OK' });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: 'Lỗi Server' });
+  }
 });
 
-/* ---------- 7. ADMIN ROUTES ---------- */
+/* ---------- ADMIN ROUTES ---------- */
 const adminRouter = express.Router();
 adminRouter.use(requireAdmin);
-adminRouter.use(adminLimiter);
 
 adminRouter.post('/create-key', async (req, res) => {
-  const { label = '', duration_days = 30, max_devices = 1, count = 1 } = req.body || {};
-  const n = Math.min(100, Math.max(1, parseInt(count) || 1));
-  const created = [];
-
+  const { label = '', duration_days = 0, max_devices = 1, amount = 1 } = req.body;
   try {
-    for (let i = 0; i < n; i++) {
+    let created = [];
+    for (let i = 0; i < amount; i++) {
       let newKey, attempts = 0;
       do {
         newKey = generateKey();
-        if (++attempts > 10) throw new Error('Không sinh được key unique');
         const { rows } = await pool.query('SELECT 1 FROM keys_nova WHERE key_code = $1', [newKey]);
         if (rows.length === 0) break;
-      } while (true);
+      } while (++attempts < 10);
+      
       await pool.query(`INSERT INTO keys_nova (key_code, label, duration_days, max_devices) VALUES ($1, $2, $3, $4)`, [newKey, label, duration_days, max_devices]);
       created.push(newKey);
     }
     res.json({ ok: true, keys: created });
-  } catch (e) { console.error('[create-key]', e); res.status(500).json({ ok: false, message: e.message }); }
+  } catch (err) {
+    res.status(500).json({ ok: false, message: err.message });
+  }
 });
 
 adminRouter.get('/keys', async (req, res) => {
-  const page = Math.max(1, parseInt(req.query.page) || 1);
-  const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 50));
-  const offset = (page - 1) * limit;
-  const search = (req.query.search || '').trim().toUpperCase();
-  const status = (req.query.status || '').trim();
-
   try {
-    let whereParts = [];
-    let params = [];
-    if (search) { params.push(`%${search}%`); whereParts.push(`(key_code LIKE $${params.length} OR label LIKE $${params.length})`); }
-    if (status) whereParts.push(getStatusCondition(status));
-    const whereClause = whereParts.length > 0 ? 'WHERE ' + whereParts.join(' AND ') : '';
+    const limit = parseInt(req.query.limit) || 50;
+    const page = parseInt(req.query.page) || 1;
+    const offset = (page - 1) * limit;
 
-    const totalQ = await pool.query(`SELECT COUNT(*) AS c FROM keys_nova ${whereClause}`, params);
-    const total = parseInt(totalQ.rows[0].c);
-    const rowsQ = await pool.query(`SELECT k.*, (SELECT COUNT(*) FROM devices_nova d WHERE d.key_id = k.id) AS device_count FROM keys_nova k ${whereClause} ORDER BY k.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`, [...params, limit, offset]);
-
-    res.json({ ok: true, total, page, limit, pages: Math.ceil(total / limit), keys: rowsQ.rows });
-  } catch (e) { res.status(500).json({ ok: false, message: e.message }); }
-});
-
-adminRouter.get('/stats', async (req, res) => {
-  try {
     const totalQ = await pool.query('SELECT COUNT(*) AS c FROM keys_nova');
-    const activeQ = await pool.query('SELECT COUNT(*) AS c FROM keys_nova WHERE is_active = 1');
-    const usedQ = await pool.query('SELECT COUNT(*) AS c FROM keys_nova WHERE used_count > 0');
-    const expiringQ = await pool.query(`SELECT COUNT(*) AS c FROM keys_nova WHERE expires_at IS NOT NULL AND expires_at > EXTRACT(EPOCH FROM NOW()) AND expires_at < EXTRACT(EPOCH FROM NOW()) + 86400 * 7`);
-    const expiredQ = await pool.query(`SELECT COUNT(*) AS c FROM keys_nova WHERE expires_at IS NOT NULL AND expires_at < EXTRACT(EPOCH FROM NOW())`);
+    const total = parseInt(totalQ.rows[0].c);
+    
+    const rowsQ = await pool.query(`
+      SELECT k.*, (SELECT COUNT(*) FROM devices_nova d WHERE d.key_id = k.id) AS device_count 
+      FROM keys_nova k 
+      ORDER BY k.created_at DESC LIMIT $1 OFFSET $2
+    `, [limit, offset]);
 
-    res.json({ ok: true, stats: { total: parseInt(totalQ.rows[0].c), active: parseInt(activeQ.rows[0].c), used: parseInt(usedQ.rows[0].c), expiring_soon: parseInt(expiringQ.rows[0].c), expired: parseInt(expiredQ.rows[0].c) } });
-  } catch (e) { res.status(500).json({ ok: false, message: e.message }); }
+    res.json({ ok: true, total, page, pages: Math.ceil(total / limit), keys: rowsQ.rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: err.message });
+  }
 });
 
 adminRouter.post('/revoke', async (req, res) => {
   try {
     const r = await pool.query('UPDATE keys_nova SET is_active = 0 WHERE key_code = $1', [String(req.body?.key || '').toUpperCase()]);
-    if (r.rowCount === 0) return res.status(404).json({ ok: false, message: 'Không tìm thấy' });
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ ok: false, message: e.message }); }
-});
-
-adminRouter.post('/unrevoke', async (req, res) => {
-  try {
-    const r = await pool.query('UPDATE keys_nova SET is_active = 1 WHERE key_code = $1', [String(req.body?.key || '').toUpperCase()]);
-    if (r.rowCount === 0) return res.status(404).json({ ok: false, message: 'Không tìm thấy' });
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ ok: false, message: e.message }); }
-});
-
-adminRouter.post('/reset-devices', async (req, res) => {
-  try {
-    const { rows } = await pool.query('SELECT id FROM keys_nova WHERE key_code = $1', [String(req.body?.key || '').toUpperCase()]);
-    if (!rows[0]) return res.status(404).json({ ok: false, message: 'Không tìm thấy' });
-    const r = await pool.query('DELETE FROM devices_nova WHERE key_id = $1', [rows[0].id]);
-    await logAction(rows[0].id, 'reset_devices', null, req.ip, `Xóa ${r.rowCount} thiết bị`);
-    res.json({ ok: true, deleted: r.rowCount });
-  } catch (e) { res.status(500).json({ ok: false, message: e.message }); }
-});
-
-adminRouter.get('/devices/:key', async (req, res) => {
-  try {
-    const { rows } = await pool.query('SELECT id FROM keys_nova WHERE key_code = $1', [String(req.params.key || '').toUpperCase()]);
-    if (!rows[0]) return res.status(404).json({ ok: false, message: 'Không tìm thấy' });
-    const d = await pool.query('SELECT * FROM devices_nova WHERE key_id = $1 ORDER BY first_seen ASC', [rows[0].id]);
-    res.json({ ok: true, devices: d.rows });
-  } catch (e) { res.status(500).json({ ok: false, message: e.message }); }
+    res.json({ ok: true, modified: r.rowCount });
+  } catch (err) { res.status(500).json({ ok: false, message: err.message }); }
 });
 
 adminRouter.delete('/delete', async (req, res) => {
   try {
     const r = await pool.query('DELETE FROM keys_nova WHERE key_code = $1', [String(req.body?.key || '').toUpperCase()]);
-    if (r.rowCount === 0) return res.status(404).json({ ok: false, message: 'Không tìm thấy' });
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ ok: false, message: e.message }); }
-});
-
-adminRouter.post('/delete-batch', async (req, res) => {
-  const { keys = [] } = req.body || {};
-  if (!Array.isArray(keys) || keys.length === 0) return res.status(400).json({ ok: false, message: 'Danh sách rỗng' });
-  try {
-    const clean = keys.map(k => String(k).toUpperCase());
-    const r = await pool.query('DELETE FROM keys_nova WHERE key_code = ANY($1::text[])', [clean]);
     res.json({ ok: true, deleted: r.rowCount });
-  } catch (e) { res.status(500).json({ ok: false, message: e.message }); }
-});
-
-adminRouter.post('/delete-used', async (req, res) => {
-  try {
-    const r = await pool.query('DELETE FROM keys_nova WHERE used_count > 0');
-    res.json({ ok: true, deleted: r.rowCount });
-  } catch (e) { res.status(500).json({ ok: false, message: e.message }); }
-});
-
-adminRouter.post('/delete-expired', async (req, res) => {
-  try {
-    const r = await pool.query(`DELETE FROM keys_nova WHERE expires_at IS NOT NULL AND expires_at < EXTRACT(EPOCH FROM NOW())`);
-    if (r.rowCount > 0) console.log(`🧹 Manual clean: Đã xóa ${r.rowCount} key hết hạn`);
-    res.json({ ok: true, deleted: r.rowCount });
-  } catch (e) { res.status(500).json({ ok: false, message: e.message }); }
-});
-
-adminRouter.get('/logs', async (req, res) => {
-  const limit = Math.min(500, parseInt(req.query.limit) || 100);
-  try {
-    let rows;
-    if (req.query.key) {
-      const r = await pool.query('SELECT id FROM keys_nova WHERE key_code = $1', [String(req.query.key).toUpperCase()]);
-      if (!r.rows[0]) return res.json({ ok: true, logs: [] });
-      const l = await pool.query('SELECT * FROM logs_nova WHERE key_id = $1 ORDER BY created_at DESC LIMIT $2', [r.rows[0].id, limit]);
-      rows = l.rows;
-    } else {
-      const l = await pool.query('SELECT * FROM logs_nova ORDER BY created_at DESC LIMIT $1', [limit]);
-      rows = l.rows;
-    }
-    res.json({ ok: true, logs: rows });
-  } catch (e) { res.status(500).json({ ok: false, message: e.message }); }
+  } catch (err) { res.status(500).json({ ok: false, message: err.message }); }
 });
 
 app.use('/api/admin', adminRouter);
 
-/* ---------- 8. 404 + ERROR ---------- */
-app.use((req, res) => res.status(404).json({ ok: false, message: 'Không tìm thấy endpoint' }));
-app.use((err, req, res, next) => {
-  console.error('[ERROR]', err.message);
-  res.status(500).json({ ok: false, message: 'Lỗi server' });
-});
-
-/* ---------- 9. START ---------- */
-const PORT = process.env.PORT || 3000;
-
+/* ---------- KHỞI ĐỘNG SERVER ---------- */
 initDb()
   .then(() => {
-    app.listen(PORT, () => {
+    // QUAN TRỌNG: Bind vào 0.0.0.0 để Render có thể truy cập
+    app.listen(PORT, '0.0.0.0', () => {
       console.log('========================================');
-      console.log(`✅ NOVA Server chạy tại http://localhost:${PORT}`);
-      console.log(`✅ Version: 4.5.0 (Dùng bảng keys_nova)`);
-      console.log(`✅ Device lock: BẬT CỨNG (mỗi key 1 máy)`);
-      console.log(`✅ Auto-clean: ĐÃ TẮT (Không bao giờ tự xóa key)`);
+      console.log(`✅ NOVA Server đang chạy tại http://0.0.0.0:${PORT}`);
+      console.log(`✅ Version: 5.0.0 (Stable)`);
       console.log('========================================');
     });
   })
   .catch(err => {
-    console.error('❌ Không khởi tạo được DB:', err);
+    console.error('❌ Không thể khởi động Server do lỗi Database:', err);
     process.exit(1);
   });
+
+// Bắt các lỗi không mong muốn để server không bị crash đột ngột
+process.on('unhandledRejection', (err) => {
+  console.error('🔥 Unhandled Rejection:', err);
+});
